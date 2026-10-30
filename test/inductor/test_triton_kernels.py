@@ -4750,6 +4750,185 @@ class MutationTests(torch._inductor.test_case.TestCase):
             ["out_ptr"],
         )
 
+    @unittest.skipIf(
+        not HAS_CUDA_AND_TRITON or torch.version.hip is not None,
+        "requires CUDA PTX",
+    )
+    @requires_gpu
+    @common_utils.parametrize(
+        "pointer_kind,polling_mode",
+        [
+            common_utils.subtest(("scalar", "single"), name="scalar_single"),
+            common_utils.subtest(("tensor", "single"), name="tensor_single"),
+            common_utils.subtest(("scalar", "spin"), name="scalar_spin"),
+            common_utils.subtest(
+                ("scalar", "spin_with_nanosleep"), name="scalar_spin_with_nanosleep"
+            ),
+        ],
+    )
+    @common_utils.parametrize("flag_for_address", [False, True])
+    def test_acquire_polling_load(self, pointer_kind, polling_mode, flag_for_address):
+        from torch._higher_order_ops.triton_kernel_wrap import identify_accessed_tensors
+
+        @triton.jit
+        def polling_kernel(
+            flag_ptr,
+            out_ptr,
+            TENSOR_POINTER: tl.constexpr,
+            FLAG_FOR_ADDRESS: tl.constexpr,
+            SPIN_LOOP: tl.constexpr,
+            ASM: tl.constexpr,
+        ):
+            offsets = tl.arange(0, 2) if TENSOR_POINTER else 0
+            flag = tl.inline_asm_elementwise(
+                ASM,
+                "=r,l",
+                [flag_ptr + offsets],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            if SPIN_LOOP:
+                while flag == 0:
+                    flag = tl.inline_asm_elementwise(
+                        ASM,
+                        "=r,l",
+                        [flag_ptr + offsets],
+                        dtype=tl.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+            offset = offsets + (flag if FLAG_FOR_ADDRESS else 0)
+            tl.store(out_ptr + offset, flag)
+
+        asm = "ld.acquire.gpu.global.b32 $0, [$1];"
+        if polling_mode == "spin_with_nanosleep":
+            asm = "nanosleep.u32 100; " + asm
+        flag = torch.ones(2, dtype=torch.int32)
+        out = torch.empty(3, dtype=torch.int32)
+        tensor_accesses = identify_accessed_tensors(
+            polling_kernel,
+            {
+                "flag_ptr": flag,
+                "out_ptr": out,
+                "TENSOR_POINTER": pointer_kind == "tensor",
+                "FLAG_FOR_ADDRESS": flag_for_address,
+                "SPIN_LOOP": polling_mode != "single",
+                "ASM": asm,
+            },
+            {},
+        )
+        self.assertEqual(
+            [dep.name for dep in tensor_accesses.read_writes.reads], ["flag_ptr"]
+        )
+        self.assertEqual(
+            [dep.name for dep in tensor_accesses.read_writes.writes], ["out_ptr"]
+        )
+        self.assertTrue(tensor_accesses.can_fuse_epilogue)
+
+    @unittest.skipIf(
+        not HAS_CUDA_AND_TRITON or torch.version.hip is not None,
+        "requires CUDA PTX",
+    )
+    @requires_gpu
+    @common_utils.parametrize("loop_kind", ["while", "for"])
+    @common_utils.parametrize("iterations", [0, 2])
+    @common_utils.parametrize("store_in_loop", [False, True])
+    def test_polling_loop_carried_pointer(self, loop_kind, iterations, store_in_loop):
+        from torch._higher_order_ops.triton_kernel_wrap import (
+            identify_accessed_tensors,
+            kernel_side_table,
+        )
+
+        @triton.jit
+        def polling_store(
+            flag_ptr,
+            a_ptr,
+            b_ptr,
+            STORE_IN_LOOP: tl.constexpr,
+            LOOP_KIND: tl.constexpr,
+            ITERATIONS: tl.constexpr,
+        ):
+            p = a_ptr
+            offset = 0
+            flag = tl.inline_asm_elementwise(
+                "ld.acquire.gpu.global.b32 $0, [$1];",
+                "=r,l",
+                [flag_ptr],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            if LOOP_KIND == "while":
+                while flag == 0:
+                    if STORE_IN_LOOP:
+                        tl.store(p, 1.0)
+                    p = b_ptr
+                    offset += 1
+                    flag = tl.inline_asm_elementwise(
+                        "ld.acquire.gpu.global.b32 $0, [$1];",
+                        "=r,l",
+                        [flag_ptr + offset],
+                        dtype=tl.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+            else:
+                for offset in range(tl.load(flag_ptr + ITERATIONS + 1)):
+                    if STORE_IN_LOOP:
+                        tl.store(p, 1.0)
+                    p = b_ptr
+                    flag = tl.inline_asm_elementwise(
+                        "ld.acquire.gpu.global.b32 $0, [$1];",
+                        "=r,l",
+                        [flag_ptr + offset + 1],
+                        dtype=tl.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+            if not STORE_IN_LOOP:
+                tl.store(p, 1.0)
+
+        flag = torch.zeros(iterations + 2, device=GPU_TYPE, dtype=torch.int32)
+        flag[-2] = 1
+        flag[-1] = iterations
+        a = torch.zeros(1, device=GPU_TYPE)
+        b = torch.zeros_like(a)
+        kwargs = {"flag_ptr": flag, "a_ptr": a, "b_ptr": b}
+        constants = {
+            "STORE_IN_LOOP": store_in_loop,
+            "LOOP_KIND": loop_kind,
+            "ITERATIONS": iterations,
+        }
+        ttir, _ = generate_ttir(polling_store, {**kwargs, **constants}, {})
+        self.assertIn(f"scf.{loop_kind}", str(ttir))
+        accesses = identify_accessed_tensors(polling_store, {**kwargs, **constants}, {})
+        writes = [dep.name for dep in accesses.read_writes.writes]
+        outputs = triton_kernel_wrapper_functional(
+            kernel_idx=kernel_side_table.add_kernel(polling_store),
+            constant_args_idx=kernel_side_table.add_constant_args(constants),
+            grid=[(1,)],
+            tma_descriptor_metadata={},
+            kwargs=kwargs,
+            tensors_to_clone=writes,
+        )
+        self.assertEqual(a, torch.zeros_like(a))
+        self.assertEqual(b, torch.zeros_like(b))
+        self.assertEqual(writes, ["a_ptr", "b_ptr"])
+        self.assertEqual([dep.name for dep in accesses.read_writes.reads], ["flag_ptr"])
+        self.assertFalse(accesses.can_fuse_epilogue)
+        expected_a = torch.full_like(
+            a, int(iterations > 0 if store_in_loop else iterations == 0)
+        )
+        expected_b = torch.full_like(
+            b, int(iterations > 1 if store_in_loop else iterations > 0)
+        )
+        self.assertEqual(outputs["a_ptr"], expected_a)
+        self.assertEqual(outputs["b_ptr"], expected_b)
+        polling_store[(1,)](flag, a, b, store_in_loop, loop_kind, iterations)
+        self.assertEqual(a, expected_a)
+        self.assertEqual(b, expected_b)
+
     # Regression test for #169782
     @make_mutation_test
     def test_with_none_arg():
@@ -5554,6 +5733,158 @@ class MutationTests(torch._inductor.test_case.TestCase):
         )
         self.assertEqual(get_tma_stores(functions, "main"), {Param(idx=0)})
 
+    @common_utils.parametrize("loop_kind", ["scf.while", "scf.for"])
+    @common_utils.parametrize("store_after_loop", [False, True])
+    @common_utils.parametrize("select_pointer", [False, True])
+    def test_tma_store_through_structured_state(
+        self, loop_kind, store_after_loop, select_pointer
+    ):
+        from torch._higher_order_ops import triton_kernel_wrap as tkw
+
+        state_a, state_b, result, descriptor, selected = (
+            tkw.Intermediate(i) for i in range(5)
+        )
+        create_a, create_b, store = (tkw.Intermediate(i) for i in (-1, -2, -3))
+        backedge = selected if select_pointer else state_b
+        functions = {
+            "main": {
+                create_a: [
+                    tkw.Op(
+                        "tt.experimental_tensormap_create",
+                        None,
+                        [tkw.Param(0), tkw.Param(1)],
+                        create_a,
+                    )
+                ],
+                create_b: [
+                    tkw.Op(
+                        "tt.experimental_tensormap_create",
+                        None,
+                        [tkw.Param(2), tkw.Param(3)],
+                        create_b,
+                    )
+                ],
+                state_a: [tkw.Op(loop_kind, None, [tkw.Param(0), backedge], state_a)],
+                state_b: [tkw.Op(loop_kind, None, [tkw.Param(2), state_a], state_b)],
+                result: [tkw.Op(loop_kind, None, [state_a], result)],
+                descriptor: [
+                    tkw.Op(
+                        "tt.reinterpret_tensor_descriptor",
+                        None,
+                        [result if store_after_loop else state_a],
+                        descriptor,
+                    )
+                ],
+                store: [
+                    tkw.Op("tt.experimental_descriptor_store", None, [descriptor], store)
+                ],
+            }
+        }
+        if select_pointer:
+            functions["main"][selected] = [
+                tkw.Op("arith.select", None, [tkw.Param(4), state_b, state_a], selected)
+            ]
+        tkw.analyze_kernel_access.reset()
+        tkw.get_tma_stores.reset()
+        try:
+            accesses = tkw.analyze_kernel_access(
+                functions,
+                "main",
+                5,
+                ("descriptor_a", "data_a", "descriptor_b", "data_b"),
+                frozenset(range(4)),
+            )
+            self.assertEqual(
+                [dep.name for dep in accesses.read_writes.writes],
+                ["descriptor_a", "data_a", "descriptor_b", "data_b"],
+            )
+            self.assertFalse(accesses.can_fuse_epilogue)
+        finally:
+            tkw.analyze_kernel_access.reset()
+            tkw.get_tma_stores.reset()
+
+    @common_utils.parametrize(
+        "case_name, asm, constraints, is_pure, expected_reads",
+        [
+            ("relaxed", "ld.relaxed.gpu.global.b32 $0, [$1];", "=r,l", False, (0,)),
+            (
+                "sleep",
+                "nanosleep.u32 50; ld.relaxed.gpu.global.b32 $0, [$1];",
+                "=r,l",
+                False,
+                (0,),
+            ),
+            ("acquire", "ld.acquire.gpu.global.b32 $0, [$1];", "=r,l", False, (0,)),
+            ("pure", "mov.b64 $0, $1;", "=l,l", True, ()),
+            ("store", "st.global.b32 [$1], $0;", "r,l", False, None),
+            (
+                "mixed",
+                "ld.acquire.gpu.global.b32 $0, [$1]; st.global.b32 [$1], $0;",
+                "=r,l",
+                False,
+                None,
+            ),
+            (
+                "constraints",
+                "ld.acquire.gpu.global.b32 $0, [$1];",
+                "=r,+l",
+                False,
+                None,
+            ),
+            ("sys_scope", "ld.acquire.sys.global.b32 $0, [$1];", "=r,l", False, None),
+            ("cta_scope", "ld.acquire.cta.global.b32 $0, [$1];", "=r,l", False, None),
+            ("u32", "ld.acquire.gpu.global.u32 $0, [$1];", "=r,l", False, None),
+            ("s32", "ld.acquire.gpu.global.s32 $0, [$1];", "=r,l", False, None),
+            ("volatile", "ld.volatile.global.b32 $0, [$1];", "=r,l", False, None),
+            ("braces", "{ ld.acquire.gpu.global.b32 $0, [$1]; }", "=r,l", False, None),
+            (
+                "dynamic_sleep",
+                "nanosleep.u32 $0; ld.acquire.gpu.global.b32 $0, [$1];",
+                "=r,l",
+                False,
+                None,
+            ),
+            ("missing_metadata", None, None, False, None),
+        ],
+        name_fn=lambda case_name, *args: case_name,
+    )
+    def test_kernel_access_inline_asm(
+        self, case_name, asm, constraints, is_pure, expected_reads
+    ):
+        from torch._higher_order_ops.triton_kernel_wrap import (
+            _classify_inline_asm,
+            analyze_kernel_access,
+            Intermediate,
+            Op,
+            Param,
+        )
+
+        result = Intermediate(0)
+        op = Op(
+            "tt.elementwise_inline_asm",
+            None,
+            [Param(0)],
+            result,
+            is_pure=is_pure,
+            inline_asm=asm,
+            asm_constraints=constraints,
+        )
+        self.assertEqual(_classify_inline_asm(op), expected_reads)
+        functions = {"main": {result: [op]}}
+        analyze_kernel_access.reset()
+        if expected_reads is None:
+            with self.assertRaisesRegex(RuntimeError, "ttir analysis hit an op"):
+                analyze_kernel_access(functions, "main", 1, ("flag",), frozenset({0}))
+        else:
+            accesses = analyze_kernel_access(
+                functions, "main", 1, ("flag",), frozenset({0})
+            )
+            self.assertEqual(
+                [dep.name for dep in accesses.read_writes.reads],
+                ["flag"] if expected_reads else [],
+            )
+            self.assertEqual(list(accesses.read_writes.writes), [])
+
     def test_tensormap_create_marks_descriptor_write(self):
         from torch._higher_order_ops.triton_kernel_wrap import (
             analyze_kernel_access,
@@ -5650,6 +5981,157 @@ class MutationTests(torch._inductor.test_case.TestCase):
             tkw.register_kernel_access_op(
                 "custom_tma.invalid", write_indexes=[0], ignore_if=lambda op: True
             )
+
+    @common_utils.parametrize("gate", ["ignore_if", "supported_if", "both"])
+    @common_utils.parametrize("supported", [False, True])
+    @common_utils.parametrize(
+        "name", ["custom_tma.legacy_support", "tt.experimental_tensormap_create"]
+    )
+    def test_register_kernel_access_op_legacy_support_alias(
+        self, gate, supported, name
+    ):
+        from torch._higher_order_ops import triton_kernel_wrap as tkw
+
+        result = tkw.Intermediate(-1)
+        functions = {"main": {result: [tkw.Op(name, None, [tkw.Param(0)], result)]}}
+        kwargs = {gate: lambda op: supported}
+        if gate == "both":
+            kwargs = {
+                "ignore_if": lambda op: not supported,
+                "supported_if": lambda op: supported,
+            }
+        tkw.analyze_kernel_access.reset()
+        try:
+            with mock.patch.dict(tkw._KERNEL_ACCESS_OPS):
+                if gate == "both":
+                    original_ops = tkw._KERNEL_ACCESS_OPS.copy()
+                    with self.assertRaisesRegex(
+                        AssertionError, "ignore_if cannot be combined with supported_if"
+                    ):
+                        tkw.register_kernel_access_op(name, **kwargs)
+                    self.assertEqual(tkw._KERNEL_ACCESS_OPS, original_ops)
+                    return
+                tkw.register_kernel_access_op(name, **kwargs)
+                if supported:
+                    accesses = tkw.analyze_kernel_access(
+                        functions, "main", 1, ("ptr",), frozenset({0})
+                    )
+                    self.assertFalse(accesses.read_writes.reads)
+                    self.assertFalse(accesses.read_writes.writes)
+                else:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "ttir analysis hit an op"
+                    ):
+                        tkw.analyze_kernel_access(
+                            functions, "main", 1, ("ptr",), frozenset({0})
+                        )
+        finally:
+            tkw.analyze_kernel_access.reset()
+
+    @common_utils.parametrize("supported", [False, True])
+    @common_utils.parametrize("is_tma_store", [False, True])
+    def test_register_kernel_access_op_support_gates_indexes(
+        self, supported, is_tma_store
+    ):
+        from torch._higher_order_ops import triton_kernel_wrap as tkw
+
+        name = "custom_tma.support_test"
+        result = tkw.Intermediate(-1)
+        functions = {
+            "main": {
+                result: [tkw.Op(name, None, [tkw.Param(0)], result, is_pure=supported)]
+            }
+        }
+
+        def indexes(op):
+            self.assertTrue(op.is_pure, "Unsupported op reached an index callback")
+            return [0]
+
+        try:
+            tkw.register_kernel_access_op(
+                name,
+                read_indexes=indexes,
+                write_indexes=indexes,
+                is_tma_store=is_tma_store,
+                supported_if=lambda op: op.is_pure,
+            )
+            tkw.analyze_kernel_access.reset()
+            tkw.get_tma_stores.reset()
+            if supported:
+                accesses = tkw.analyze_kernel_access(
+                    functions, "main", 1, ("ptr",), frozenset({0})
+                )
+                self.assertEqual(
+                    [dep.name for dep in accesses.read_writes.reads], ["ptr"]
+                )
+                self.assertEqual(
+                    [dep.name for dep in accesses.read_writes.writes], ["ptr"]
+                )
+            else:
+                with self.assertRaisesRegex(RuntimeError, "ttir analysis hit an op"):
+                    tkw.analyze_kernel_access(
+                        functions, "main", 1, ("ptr",), frozenset({0})
+                    )
+        finally:
+            tkw.unregister_kernel_access_op(name)
+            tkw.analyze_kernel_access.reset()
+            tkw.get_tma_stores.reset()
+
+    @common_utils.parametrize(
+        "case_name, load_op, registered_is_load, expected_is_load",
+        [
+            ("load", "tt.load", None, True),
+            ("tensor_descriptor", "tt.load_tensor_descriptor", None, True),
+            ("descriptor", "tt.descriptor_load", None, True),
+            ("gather", "tt.descriptor_gather", None, True),
+            ("registered_load", "test.load", True, True),
+            ("registered_pointer", "test.load", False, False),
+            ("predicate_load", "test.load", lambda op: op.is_pure, True),
+            ("predicate_pointer", "test.load", lambda op: op.is_pure, False),
+        ],
+        name_fn=lambda case_name, *args: case_name,
+    )
+    def test_load_result_in_store_address(
+        self, case_name, load_op, registered_is_load, expected_is_load
+    ):
+        from torch._higher_order_ops import triton_kernel_wrap as tkw
+
+        loaded, address, sink = (tkw.Intermediate(i) for i in (0, 1, -1))
+        functions = {
+            "main": {
+                loaded: [
+                    tkw.Op(
+                        load_op, None, [tkw.Param(0)], loaded, is_pure=expected_is_load
+                    )
+                ],
+                address: [tkw.Op("tt.addptr", None, [tkw.Param(1), loaded], address)],
+                sink: [tkw.Op("tt.store", None, [address], sink)],
+            }
+        }
+        tkw.analyze_kernel_access.reset()
+        tkw.get_tma_stores.reset()
+        try:
+            with mock.patch.dict(tkw._KERNEL_ACCESS_OPS):
+                if registered_is_load is not None:
+                    tkw.register_kernel_access_op(
+                        load_op, read_indexes=[0], is_load=registered_is_load
+                    )
+                accesses = tkw.analyze_kernel_access(
+                    functions, "main", 2, ("source", "out_ptr"), frozenset({0, 1})
+                )
+                self.assertEqual(
+                    [dep.name for dep in accesses.read_writes.reads], ["source"]
+                )
+                expected_writes = (
+                    ["out_ptr"] if expected_is_load else ["source", "out_ptr"]
+                )
+                self.assertEqual(
+                    [dep.name for dep in accesses.read_writes.writes], expected_writes
+                )
+                self.assertEqual(accesses.can_fuse_epilogue, expected_is_load)
+        finally:
+            tkw.analyze_kernel_access.reset()
+            tkw.get_tma_stores.reset()
 
     def test_kernel_access_op_can_read_and_write(self):
         from torch._higher_order_ops.triton_kernel_wrap import (
@@ -8260,6 +8742,7 @@ if HAS_CUDA_AND_TRITON:
 
 common_utils.instantiate_parametrized_tests(KernelTests)
 common_utils.instantiate_parametrized_tests(CustomOpTests)
+common_utils.instantiate_parametrized_tests(MutationTests)
 common_utils.instantiate_parametrized_tests(TestUserKernelEpilogueFusion)
 
 

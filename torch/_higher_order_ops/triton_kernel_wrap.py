@@ -8,6 +8,7 @@ import inspect
 import itertools
 import logging
 import operator
+import re
 import types
 import typing
 from collections import defaultdict
@@ -415,6 +416,8 @@ class Op:
     # used for tt.elementwise_inline_asm
     # `is_pure = True` assumes the asm block has no side-effects
     is_pure: bool = False
+    inline_asm: str | None = None
+    asm_constraints: str | None = None
 
     def __post_init__(self) -> None:
         if self.name == "tt.call":
@@ -829,11 +832,75 @@ def ttir_to_functions(
 
             fn_name = op.get_str_attr("sym_name")
             functions[fn_name] = fn_ops
+        elif name in ("scf.for", "scf.while"):
+            if name == "scf.for":
+                if len(child_block_ids) != 1 or len(operand_ids) < 3:
+                    raise RuntimeError("Expected one body and three bounds for scf.for")
+                body_id = child_block_ids[0]
+                body_ops = op_stack.pop(body_id)
+                _, yield_ops = body_ops.popitem()
+                block_args = block_id_to_block_arg_ids[body_id]
+                if not block_args:
+                    raise RuntimeError("Expected an induction variable for scf.for")
+                next_fake_intermediate -= 1
+                replacements[block_args[0]] = Intermediate(next_fake_intermediate)
+                state_args = block_args[1:]
+                initial_ids = operand_ids[3:]
+                result_args = [Intermediate(idx) for idx in state_args]
+                forwarded_ids = []
+                forwarded_args = []
+                block_ops_to_inline = (body_ops,)
+            else:
+                if len(child_block_ids) != 2:
+                    raise RuntimeError(
+                        "Expected one before and one after block for scf.while"
+                    )
+                before_id, after_id = child_block_ids
+                before_ops = op_stack.pop(before_id)
+                after_ops = op_stack.pop(after_id)
+                _, condition_ops = before_ops.popitem()
+                _, yield_ops = after_ops.popitem()
+                if len(condition_ops) != 1 or condition_ops[0].name != "scf.condition":
+                    raise RuntimeError("Expected scf.condition terminator for scf.while")
+                state_args = block_id_to_block_arg_ids[before_id]
+                initial_ids = operand_ids
+                result_args = condition_ops[0].args[1:]
+                forwarded_ids = block_id_to_block_arg_ids[after_id]
+                forwarded_args = result_args
+                block_ops_to_inline = (before_ops, after_ops)
+            if len(yield_ops) != 1 or yield_ops[0].name != "scf.yield":
+                raise RuntimeError(f"Expected scf.yield terminator for {name}")
+            yield_args = yield_ops[0].args
+            if (
+                len(state_args) != len(initial_ids)
+                or len(yield_args) != len(state_args)
+                or len(result_ids) != len(result_args)
+                or len(forwarded_ids) != len(forwarded_args)
+            ):
+                raise RuntimeError(f"Inconsistent {name} block arguments and results")
+
+            for block_ops in block_ops_to_inline:
+                for result, child_ops in block_ops.items():
+                    op_stack[parent_block_id][result].extend(child_ops)
+
+            # Loop state joins initial operands and backedges, including cycles.
+            for idx, initial_id, yield_arg in zip(state_args, initial_ids, yield_args):
+                state = Intermediate(idx)
+                args = list(dict.fromkeys([Intermediate(initial_id), yield_arg]))
+                op_stack[parent_block_id][state].append(Op(name, None, args, state))
+
+            # While conditions forward values to the body and to the exit. For
+            # results use the joined body state, including zero-iteration exits.
+            for idx, forwarded_arg in zip(forwarded_ids, forwarded_args):
+                replacements[idx] = forwarded_arg
+            for idx, result_arg in zip(result_ids, result_args):
+                result = Intermediate(idx)
+                op_stack[parent_block_id][result].append(
+                    Op(name, None, [result_arg], result)
+                )
         elif child_block_ids:
             structured_region_ops = {
                 "scf.if",
-                "scf.for",
-                "scf.while",
                 "tt.reduce",
                 "tt.scan",
             }
@@ -847,27 +914,7 @@ def ttir_to_functions(
                 # child block to return the block result
                 return_ops = []
                 for block_id in child_block_ids:
-                    if name == "scf.for":
-                        # example:
-                        # %result = scf.for %iv = %lb to %ub step %step iter_args(%arg = %init) -> (i32) ...
-                        # block args: 2 (%iv, %arg)
-                        # op operands: 4 (%lb, %ub, %step, %init)
-                        # `%arg` is mapping to `%init`
-                        for i, idx in enumerate(block_id_to_block_arg_ids[block_id]):
-                            if i == 0:
-                                next_fake_intermediate -= 1
-                                replacements[idx] = Intermediate(next_fake_intermediate)
-                            else:
-                                replacements[idx] = Intermediate(operand_ids[i + 2])
-                    elif name == "scf.while":
-                        # example:
-                        # %3:3 = scf.while (%arg2 = %1, %arg3 = %2, %arg4 = %c0_i32_8) ...
-                        # block args: 3 (%arg2, %arg3, %arg4)
-                        # op operands: 3 (%1, %2, %c0_i32_8)
-                        # `%arg2` is mapping to `%1`, `%arg3` is mapping to `%2`, ...
-                        for i, idx in enumerate(block_id_to_block_arg_ids[block_id]):
-                            replacements[idx] = Intermediate(operand_ids[i])
-                    elif name == "scf.if":
+                    if name == "scf.if":
                         # the scf block args are ignored by the pass. but, as they
                         # may be used as operands of the ops inside the block
                         # (and nested blocks inlined in the current block by now),
@@ -983,7 +1030,7 @@ def ttir_to_functions(
                     # looks at the mutated arg in tt.store; then looks for its source ops; and then recurses on the
                     # arguments to each of the source ops.
                     #
-                    # In the case of scf.if/scf.for, we may have multiple return ops, each passed as an arg
+                    # In the case of scf.if, we may have multiple return ops, each passed as an arg
                     # to scf.yield:
                     #
                     # %18:2 = scf.if %... -> (!tt.ptr<f32>, !tt.ptr<f32>) {
@@ -1034,19 +1081,41 @@ def ttir_to_functions(
             block_ops = op_stack[parent_block_id]
 
             is_pure = False
+            inline_asm = None
+            asm_constraints = None
             # Handle the case for tt.elementwise_inline_asm to set `is_pure` for mutation analysis
             if name == "tt.elementwise_inline_asm":
                 is_pure = op.get_bool_attr("pure")
+                inline_asm = op.get_str_attr("asm_string")
+                asm_constraints = op.get_str_attr("constraints")
 
             if result_ids:
                 for result_id in result_ids:
                     res = Intermediate(result_id)
-                    block_ops[res].append(Op(name, callee, args, res, is_pure=is_pure))
+                    block_ops[res].append(
+                        Op(
+                            name,
+                            callee,
+                            args,
+                            res,
+                            is_pure=is_pure,
+                            inline_asm=inline_asm,
+                            asm_constraints=asm_constraints,
+                        )
+                    )
             else:
                 next_fake_intermediate -= 1
                 fake_res = Intermediate(next_fake_intermediate)
                 block_ops[fake_res].append(
-                    Op(name, callee, args, fake_res, is_pure=is_pure)
+                    Op(
+                        name,
+                        callee,
+                        args,
+                        fake_res,
+                        is_pure=is_pure,
+                        inline_asm=inline_asm,
+                        asm_constraints=asm_constraints,
+                    )
                 )
 
     ttir_module.walk(mlir_to_functions)
@@ -1084,28 +1153,13 @@ class MemoizeWithCycleCheck:
 def get_tma_stores(
     functions: dict[str, dict[Intermediate, list[Op]]], fn_name: str
 ) -> set[Intermediate | Param]:
-    """
-    Identifies all intermediates and parameters that are written to by a
-    `tt.experimental_descriptor_store`. It tracks only the specific values
-    written to via experimental_descriptor_store and the input values to
-    `tt.reinterpret_tensor_descriptor` used to construct the direct inputs
-    to tt.experimental_descriptor_store - not any recursive values
-    used to construct those values.
+    """Find descriptor address dependencies used by TMA stores.
 
-    For example: for
-      tt.reinterpret_tensor_descriptor(Intermediate(idx=0), ...)
-      Intermediate(idx=1) = tt.experimental_descriptor_store(Intermediate(idx=0), ...)
-    this function will return [Intermediate(idx=0), Intermediate(idx=1)],
-
-    However
-      Intermediate(idx=4) = arith.addptr(Intermediate(idx=2), Intermediate(idx=3))
-      Intermediate(idx=5) = tt.experimental_descriptor_store(Intermediate(idx=4), ...)
-      tt.experimental_descriptor_store(Intermediate(idx=5), ...)
-    this function will mark only idx=4 and idx=5 (but not idx=2 or idx=3)
-
-    If an intermediate/parameter is passed into a function and is written to
-    via experimental_descriptor_store within that function, the argument to the
-    function will also be marked.
+    Follow value provenance, including loop state and pointer selection, so
+    device-created descriptors map back to every possible global destination.
+    Keep concrete descriptor addresses as well as their source dependencies;
+    including an ambiguous base address conservatively retains its destinations.
+    Shape metadata and selection predicates do not identify descriptor storage.
     """
 
     result: set[Intermediate | Param] = set()
@@ -1130,20 +1184,34 @@ def get_tma_stores(
                     and op_info.is_tma_store
                     and op_info.write_indexes is not None
                 ):
+                    op_info.validate_access_model(op)
                     result.update(op.args[idx] for idx in op_info.write_indexes(op))
 
-    for val in list(result):
-        if val in ops:
-            if not isinstance(val, Intermediate):
-                continue
-            for op in ops[val]:
-                if op.name == "tt.reinterpret_tensor_descriptor":
-                    if len(op.args) < 1:
-                        raise AssertionError(
-                            "tt.reinterpret_tensor_descriptor expected at least 1 arg, "
-                            f"got {len(op.args)}"
-                        )
-                    result.add(op.args[0])
+    stack = list(result)
+    seen: set[Intermediate | Param] = set()
+    while stack:
+        val = stack.pop()
+        if val in seen:
+            continue
+        seen.add(val)
+        if not isinstance(val, Intermediate):
+            continue
+        for op in ops.get(val, []):
+            if op.name in (
+                "tt.reinterpret_tensor_descriptor",
+                "tt.make_tensor_descriptor",
+                "tt.make_tensor_ptr",
+                "tt.advance",
+            ):
+                if not op.args:
+                    raise AssertionError(f"{op.name} expected at least 1 arg, got 0")
+                forwarded_args = op.args[:1]
+            elif op.name == "arith.select":
+                forwarded_args = op.args[1:]
+            else:
+                forwarded_args = op.args
+            result.update(forwarded_args)
+            stack.extend(forwarded_args)
 
     return result
 
@@ -1154,10 +1222,14 @@ class TensorAccesses:
     can_fuse_epilogue: bool
 
 
-class IgnoreUnknownOp(Protocol):
-    """Returns True if the op should be skipped; otherwise the caller raises."""
+class OpPredicate(Protocol):
+    """Return an operation-dependent boolean property."""
 
     def __call__(self, op: Op) -> bool: ...
+
+
+# Preserve the legacy callback type name for external registrations.
+IgnoreUnknownOp = OpPredicate
 
 
 class ReadWriteIndexes(Protocol):
@@ -1178,12 +1250,51 @@ def first_two_args(op: Op) -> list[int]:
     return list(range(min(2, len(op.args))))
 
 
+def _classify_inline_asm(op: Op) -> tuple[int, ...] | None:
+    """Return read indexes for pure asm or polling loads; None means unsupported."""
+    if op.name != "tt.elementwise_inline_asm":
+        return None
+    if op.is_pure:
+        return ()
+
+    # Only .gpu.global.b32 acquire/relaxed loads, optionally preceded by a
+    # literal nanosleep, are supported. Other scopes/types, volatile loads,
+    # brace-wrapped asm, dynamic sleeps, and extra instructions/operands retain
+    # conservative handling.
+    if (
+        len(op.args) == 1
+        and op.asm_constraints is not None
+        and op.asm_constraints.replace(" ", "") == "=r,l"
+        and op.inline_asm is not None
+        and re.fullmatch(
+            r"\s*(?:nanosleep\.u32\s+[0-9]+;\s*)?"
+            r"ld\.(?:relaxed|acquire)\.gpu\.global\.b32\s+\$0,\s*\[\$1\];\s*",
+            op.inline_asm,
+        )
+        is not None
+    ):
+        return (0,)
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class _KernelAccessOpInfo:
     read_indexes: ReadWriteIndexes | None = None
     write_indexes: ReadWriteIndexes | None = None
     is_tma_store: bool = False
-    ignore_if: IgnoreUnknownOp | None = None
+    supported_if: OpPredicate | None = None
+    is_load: bool | OpPredicate = False
+
+    def validate_access_model(self, op: Op) -> None:
+        """Reject unsupported operations before evaluating access callbacks."""
+        if self.supported_if is not None and not self.supported_if(op):
+            raise RuntimeError(
+                f"ttir analysis hit an op we do not know how to analyze: {op.name}"
+            )
+
+    def result_is_loaded(self, op: Op) -> bool:
+        """Return whether memory provides this operation's result."""
+        return self.is_load(op) if callable(self.is_load) else self.is_load
 
 
 # List from Triton Github include/triton/Dialect/Triton/IR/TritonOps.td.
@@ -1201,14 +1312,16 @@ _KERNEL_ACCESS_OPS: dict[str, _KernelAccessOpInfo] = {
         read_indexes=first_arg, write_indexes=first_arg
     ),
     "tt.experimental_tensormap_create": _KernelAccessOpInfo(write_indexes=first_arg),
-    "tt.load": _KernelAccessOpInfo(read_indexes=first_arg),
-    "tt.load_tensor_descriptor": _KernelAccessOpInfo(read_indexes=first_arg),
-    "tt.descriptor_load": _KernelAccessOpInfo(read_indexes=first_arg),
+    "tt.load": _KernelAccessOpInfo(read_indexes=first_arg, is_load=True),
+    "tt.load_tensor_descriptor": _KernelAccessOpInfo(
+        read_indexes=first_arg, is_load=True
+    ),
+    "tt.descriptor_load": _KernelAccessOpInfo(read_indexes=first_arg, is_load=True),
     "tt.descriptor_reduce": _KernelAccessOpInfo(
         read_indexes=first_arg, write_indexes=first_arg
     ),
     "tt.descriptor_scatter": _KernelAccessOpInfo(write_indexes=first_arg),
-    "tt.descriptor_gather": _KernelAccessOpInfo(read_indexes=first_arg),
+    "tt.descriptor_gather": _KernelAccessOpInfo(read_indexes=first_arg, is_load=True),
     "ttng.async_tma_copy_global_to_local": _KernelAccessOpInfo(
         read_indexes=first_two_args
     ),
@@ -1218,7 +1331,11 @@ _KERNEL_ACCESS_OPS: dict[str, _KernelAccessOpInfo] = {
     ),
     "ttng.async_tma_scatter": _KernelAccessOpInfo(write_indexes=first_arg),
     "ttng.async_tma_gather": _KernelAccessOpInfo(read_indexes=first_arg),
-    "tt.elementwise_inline_asm": _KernelAccessOpInfo(ignore_if=lambda op: op.is_pure),
+    "tt.elementwise_inline_asm": _KernelAccessOpInfo(
+        read_indexes=lambda op: _classify_inline_asm(op) or (),
+        supported_if=lambda op: _classify_inline_asm(op) is not None,
+        is_load=lambda op: bool(_classify_inline_asm(op)),
+    ),
 }
 
 
@@ -1236,17 +1353,35 @@ def register_kernel_access_op(
     write_indexes: Sequence[int] | ReadWriteIndexes | None = None,
     is_tma_store: bool = False,
     ignore_if: IgnoreUnknownOp | None = None,
+    supported_if: OpPredicate | None = None,
+    is_load: bool | OpPredicate = False,
 ) -> None:
-    """Register a Triton op for kernel read/write analysis."""
+    """Register a Triton op for kernel tensor read/write analysis.
+
+    A supported_if callback returning False rejects the op before any index
+    callback runs; True permits analysis. Rejection raises into the caller's
+    conservative fallback. The legacy ignore_if keyword is an alias; passing
+    both aliases is rejected. It remains restricted to ops without read/write
+    indexes, so accepting the op models no tensor accesses.
+    is_load marks results read from memory, so write-address tracing stops at
+    those results instead of marking the source pointer as written. It may be
+    a constant bool or an operation predicate; it does not affect read tracing.
+    """
     if is_tma_store and write_indexes is None:
         raise AssertionError(
             f"{name} is marked as a TMA store but has no write indexes"
         )
     has_indexes = read_indexes is not None or write_indexes is not None
-    if ignore_if is not None and has_indexes:
-        raise AssertionError(
-            f"{name}: ignore_if cannot be combined with read/write indexes"
-        )
+    if ignore_if is not None:
+        if supported_if is not None:
+            raise AssertionError(
+                f"{name}: ignore_if cannot be combined with supported_if"
+            )
+        if has_indexes:
+            raise AssertionError(
+                f"{name}: ignore_if cannot be combined with read/write indexes"
+            )
+        supported_if = ignore_if
     _KERNEL_ACCESS_OPS[name] = _KernelAccessOpInfo(
         read_indexes=(
             None if read_indexes is None else _read_write_indexes(read_indexes)
@@ -1255,7 +1390,8 @@ def register_kernel_access_op(
             None if write_indexes is None else _read_write_indexes(write_indexes)
         ),
         is_tma_store=is_tma_store,
-        ignore_if=ignore_if,
+        supported_if=supported_if,
+        is_load=is_load,
     )
 
 
@@ -1299,15 +1435,11 @@ def analyze_kernel_access(
 
     for op_list in ops.values():
         for op in op_list:
-            # If we encounter an operation with effects that cannot be reliably analyzed
-            # (e.g. `tt.elementwise_inline_asm`), we assume it does not mutate any input parameters.
             op_info = _KERNEL_ACCESS_OPS.get(op.name)
-            if op_info is not None and op_info.ignore_if is not None:
-                if op_info.ignore_if(op):
+            if op_info is not None:
+                op_info.validate_access_model(op)
+                if op_info.read_indexes is None and op_info.write_indexes is None:
                     continue
-                raise RuntimeError(
-                    f"ttir analysis hit an op we do not know how to analyze: {op.name}"
-                )
 
             if op.name == "tt.experimental_tensormap_create":
                 # Note: this is how we implement experimental_descriptor_store mutation analysis.
@@ -1375,10 +1507,11 @@ def analyze_kernel_access(
     ) -> dict[int, int]:
         """DFS traversal to find argument indices that are accessed (and how many times they are accessed)."""
         access_count = dict()
-        stack = initial_stack[:]
+        # Cut cycles on each dependency path without merging distinct accesses.
+        stack = [(arg, frozenset()) for arg in initial_stack]
 
         while stack:
-            arg = stack.pop()
+            arg, seen = stack.pop()
 
             if isinstance(arg, Param):
                 if arg.idx >= num_args:
@@ -1389,14 +1522,20 @@ def analyze_kernel_access(
                     access_count[arg.idx] = 1
                 else:
                     access_count[arg.idx] += 1
-            elif isinstance(arg, Intermediate) and not arg.fake():
+            elif isinstance(arg, Intermediate) and not arg.fake() and arg not in seen:
+                seen = seen | {arg}
                 for op in ops[arg]:
-                    if skip_loads and op.name == "tt.load":
+                    op_info = _KERNEL_ACCESS_OPS.get(op.name)
+                    if (
+                        skip_loads
+                        and op_info is not None
+                        and op_info.result_is_loaded(op)
+                    ):
                         continue
                     if op.name in POINTER_ONLY_OPS:
-                        stack.append(op.args[0])
+                        stack.append((op.args[0], seen))
                     else:
-                        stack.extend(op.args)
+                        stack.extend((op_arg, seen) for op_arg in op.args)
 
         return access_count
 
