@@ -68,10 +68,32 @@ def lite_mode_default(lite_value: bool, default: bool) -> bool:
     return default
 
 
+def _triton_compile_iq_enabled() -> bool:
+    # Deferred: the check can import triton, so only pay for it once compile_iq is requested.
+    from torch.utils._triton import (
+        triton_compile_iq_apply_enabled,
+        triton_compile_iq_collect_enabled,
+    )
+
+    return triton_compile_iq_apply_enabled() or triton_compile_iq_collect_enabled()
+
+
 def static_cuda_launcher_default() -> bool:
     STATIC_CUDA_LAUNCHER_VERSION = 2
 
-    if "TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER" in os.environ:
+    if _triton_compile_iq_enabled():
+        # fbtriton's compile_iq collect/apply hooks run in Triton's launcher, which the static
+        # launcher bypasses.
+        if os.environ.get("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER") == "1":
+            import logging
+
+            log = logging.getLogger(__name__)
+            log.warning(
+                "Ignoring TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=1: TRITON_COMPILE_IQ_COLLECT "
+                "and TRITON_COMPILE_IQ_APPLY require Triton's launcher."
+            )
+        return False
+    elif "TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER" in os.environ:
         return os.environ.get("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER") == "1"
     elif is_fbcode():
         version = torch._utils_internal.justknobs_getval_int(
