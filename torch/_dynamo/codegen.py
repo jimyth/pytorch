@@ -39,7 +39,14 @@ from .bytecode_transformation import (
     Instruction,
 )
 from .exc import unimplemented
-from .source import AttrSource, ChainedSource, DictGetItemSource, Source
+from .source import (
+    AttrSource,
+    ChainedSource,
+    ConstDictKeySource,
+    DictGetItemSource,
+    DictKeysSource,
+    Source,
+)
 from .utils import is_safe_constant
 from .variables.base import ValueMutationExisting, VariableTracker
 from .variables.functions import (
@@ -87,6 +94,17 @@ def _pregraph_marker_exit_template(cm, utils_module):
 class GraphOutputEntry:
     index: int
     variable: VariableTracker
+
+
+def _has_sourced_value(value: VariableTracker) -> bool:
+    has_source = False
+
+    def check(item: VariableTracker) -> None:
+        nonlocal has_source
+        has_source |= item.source is not None
+
+    VariableTracker.visit(check, value)
+    return has_source
 
 
 class PyCodegen:
@@ -331,8 +349,12 @@ class PyCodegen:
             if allow_cache and value in self.tempvars:
                 self._output.append(create_dup_top())
                 self.add_cache(value)
-        elif value.is_python_constant() and is_safe_constant(
-            value.as_python_constant()
+        elif (
+            value.is_python_constant()
+            and is_safe_constant(value.as_python_constant())
+            # LOAD_CONST lets CPython intern aggregate elements. Reconstruct
+            # sourced children instead to preserve their input identity.
+            and not _has_sourced_value(value)
         ):
             output.append(self.create_load_const(value.as_python_constant()))
         elif isinstance(value, TensorWithTFOverrideVariable):
@@ -706,7 +728,9 @@ class PyCodegen:
 
         def extract_nested_sources(source: Source) -> list[Source]:
             nested_sources: list[Source] = []
-            if isinstance(source, ChainedSource):
+            if isinstance(source, ConstDictKeySource):
+                nested_sources.append(DictKeysSource(source.base))
+            elif isinstance(source, ChainedSource):
                 nested_sources.append(source.base)
             if isinstance(source, DictGetItemSource) and isinstance(
                 source.index, Source

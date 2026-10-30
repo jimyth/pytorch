@@ -83,6 +83,46 @@ class ReconstructTest(torch._dynamo.test_case.TestCase):
             opt_f(d_opt, t)
             self.assertEqual(d, d_opt)
 
+    @parametrize("mapping_type", [dict, collections.OrderedDict])
+    def test_dict_input_key_snapshot_reused(self, mapping_type):
+        def hook(instructions):
+            self.assertEqual(
+                sum(
+                    i.opname == "LOAD_ATTR" and i.argval == "keys" for i in instructions
+                ),
+                1,
+            )
+
+        def fn(mapping):
+            a, b, c = mapping.values()
+            return a + b * c
+
+        mapping = mapping_type((object(), torch.full((1,), i)) for i in range(1, 4))
+        if mapping_type is collections.OrderedDict:
+            mapping.move_to_end(next(iter(mapping)))
+        with self.register_bytecode_hook(hook):
+            compiled = torch.compile(fn, backend="eager", fullgraph=True)
+            self.assertEqual(compiled(mapping), fn(mapping))
+
+    def test_sourced_dict_key_in_constant_aggregates(self):
+        def fn(x, mapping):
+            key = next(iter(mapping.copy()))
+            return x + 1, ((key,),), frozenset((key,)), slice(key, None)
+
+        counter = torch._dynamo.testing.CompileCounter()
+        compiled = torch.compile(fn, backend=counter, fullgraph=True)
+        keys = [b"layer0weight".decode() for _ in range(2)]
+        self.assertIsNot(keys[0], keys[1])
+        x = torch.ones(1)
+        for key in keys:
+            mapping = collections.OrderedDict.fromkeys([key], 1)
+            result = compiled(x, mapping)
+            self.assertEqual(result, fn(x, mapping))
+            self.assertIs(result[1][0][0], key)
+            self.assertIs(next(iter(result[2])), key)
+            self.assertIs(result[3].start, key)
+        self.assertEqual(counter.frame_count, 1)
+
     def _compile_and_capture_side_effects(self, fn, *args):
         """Compile fn and return side-effect metadata from bytecode hooks."""
         captured = {}
